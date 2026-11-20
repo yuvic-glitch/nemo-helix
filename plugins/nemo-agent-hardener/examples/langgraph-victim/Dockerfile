@@ -20,6 +20,7 @@ WORKDIR /app
 # nemo-relay carries the [langgraph] extra: that is what pulls the callback-handler integration.
 RUN pip install --no-cache-dir \
       "langgraph>=1.2,<2" \
+      "langchain>=1.0,<2" \
       "langchain-core>=1.4,<2" \
       "langchain-openai>=1.1.9,<2.0" \
       "nemo-relay[langgraph]>=0.11.0,<0.12" \

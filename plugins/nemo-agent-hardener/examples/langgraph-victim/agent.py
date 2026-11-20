@@ -17,8 +17,8 @@ hand-built graph, in both nodes:
 - The tools node is ``ToolNode(TOOLS, awrap_tool_call=relay.awrap_tool_call)``. That wrapper is *the*
   interception point — without it tool calls run outside Relay, no guardrail can refuse them, and
   Agent Hardener's tool-path preflight fails the run.
-- The model node sends each LLM call through ``nemo_relay.llm.execute``. Without it the LLM call
-  never reaches Relay: no LLM span is recorded, so the attack's trace has no prompt and no model
+- The model node sends each LLM call through ``relay.awrap_model_call``, the same hook ``create_agent``
+  runs Relay's middleware through. Without it the LLM call never reaches Relay: no LLM span is recorded, so the attack's trace has no prompt and no model
   steps, and the traces guardrails defender cannot match the attack to it or write a rail from it.
   After a refusal the guardrail plugin cannot end the turn either.
 
@@ -34,20 +34,16 @@ import os
 import signal
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING
 
-import nemo_relay
 import openai
-from langchain_core.messages import AIMessage, SystemMessage, messages_from_dict, messages_to_dict
+from langchain.agents.middleware import ModelRequest, ModelResponse
+from langchain_core.messages import AIMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
-# Private module: Relay exports the middleware but not the wire format it speaks, and a hand-built
-# graph has to speak that format itself for a guardrail to read and answer its LLM calls. An
-# invented envelope is rejected by Relay's response decoding with a TypeError that ends the turn.
-from nemo_relay.integrations.langchain._serialization import LANGCHAIN_MODEL_RESPONSE_KEY, LangChainCodec
 from nemo_relay.integrations.langgraph import NemoRelayMiddleware
 from pydantic import SecretStr
 
@@ -161,6 +157,7 @@ def _model_failure(exc: Exception) -> AIMessage:
 
 def build_agent() -> CompiledStateGraph:
     """Build and compile the agent: an LLM that loops until it stops calling tools."""
+    # Tools are bound per call from the request, so the trace records the tool schemas the model saw.
     llm = ChatOpenAI(
         model=MODEL,
         base_url=BASE_URL,
@@ -168,7 +165,21 @@ def build_agent() -> CompiledStateGraph:
         temperature=0,
         timeout=MODEL_TIMEOUT_SECONDS,
         max_retries=MODEL_MAX_RETRIES,
-    ).bind_tools(TOOLS)
+    )
+    # THE interception object. Its awrap_tool_call routes every tool call through Relay, which is what
+    # puts a guardrail intercept in the path (a bare ToolNode(TOOLS) runs the tools outside Relay), and
+    # its awrap_model_call does the same for every model call.
+    relay = NemoRelayMiddleware()
+
+    async def call_model(request: ModelRequest) -> ModelResponse:
+        """The provider call, innermost in Relay's chain. It reads everything off ``request``, so a
+        rewrite by a request intercept is what actually reaches the provider."""
+        messages = [request.system_message, *request.messages] if request.system_message else request.messages
+        try:
+            reply = await request.model.bind_tools(request.tools).ainvoke(messages)
+        except _TRANSIENT_MODEL_ERRORS as exc:
+            reply = _model_failure(exc)
+        return ModelResponse(result=[reply])
 
     async def model(state: MessagesState) -> dict[str, list]:
         """One LLM turn: decide whether to answer or to call a tool — routed through Relay.
@@ -179,33 +190,19 @@ def build_agent() -> CompiledStateGraph:
         which attack it belongs to, and the guardrail plugin's latch — which ends the turn after a
         refusal by answering the next model call itself — never sees that call.
 
-        ``create_agent`` gets this wiring from ``NemoRelayMiddleware``. A hand-built graph does it here,
-        which is what ``nemo_relay.llm.execute`` is for: the provider call becomes the innermost link
-        of the chain, and every LLM intercept wraps it.
+        ``create_agent`` runs every model call through ``NemoRelayMiddleware.awrap_model_call``; a
+        hand-built graph calls the same public hook here, with LangChain's own ``ModelRequest``.
         """
-        messages = [SystemMessage(content=SYSTEM_PROMPT), *state["messages"]]
-        codec = LangChainCodec()
-        request = nemo_relay.LLMRequest({}, {"messages": messages_to_dict(messages), "model": MODEL})
-
-        async def call(request: nemo_relay.LLMRequest) -> Any:
-            # Read the messages back off the request rather than closing over them, so a rewrite by a
-            # request intercept is what actually reaches the provider.
-            try:
-                reply = await llm.ainvoke(messages_from_dict(request.content["messages"]))
-            except _TRANSIENT_MODEL_ERRORS as exc:
-                reply = _model_failure(exc)
-            return {LANGCHAIN_MODEL_RESPONSE_KEY: {"messages": messages_to_dict([reply])}}
-
-        # execute() is typed as returning any JSON value; here it is the dict `call` returns.
-        result = cast(
-            "dict[str, Any]",
-            await nemo_relay.llm.execute(MODEL, request, call, model_name=MODEL, codec=codec, response_codec=codec),
+        request = ModelRequest(
+            model=llm,
+            messages=state["messages"],
+            system_message=SystemMessage(content=SYSTEM_PROMPT),
+            tools=TOOLS,
+            state=state,
+            runtime=None,
         )
-        return {"messages": messages_from_dict(result[LANGCHAIN_MODEL_RESPONSE_KEY]["messages"])}
-
-    # THE interception line. awrap_tool_call routes every tool call through Relay, which is what
-    # puts a guardrail intercept in the path; a bare ToolNode(TOOLS) runs the tools outside Relay.
-    relay = NemoRelayMiddleware()
+        response = await relay.awrap_model_call(request, call_model)
+        return {"messages": response.result}
 
     graph = StateGraph(MessagesState)
     graph.add_node("model", model)
